@@ -1,0 +1,221 @@
+#!/bin/bash
+
+#虚拟机镜像文件目录
+IMG_DIR=/var/lib/libvirt/images
+
+#镜像模板名称
+BASEVM=rh6_template
+
+while :
+do
+    read -p "请输入你想要的虚拟机名称：" NEWVM
+    if [ -z $NEWVM ];then
+        echo -e "\033[31m虚拟机名称不能为空！！！\033[0m"
+        continue
+    fi
+    if [ -e $IMG_DIR/${NEWVM}.img ]; then
+        echo -e "\033[31mFile exists.\033[0m"
+        continue
+    fi
+    break
+done
+
+echo -en "Creating Virtual Machine disk image......\t"
+
+#创建前端盘（COW）
+qemu-img create -f qcow2 -b $IMG_DIR/${BASEVM}.img $IMG_DIR/${NEWVM}.img &> /dev/null
+if [ $? -eq 0 ];then
+    echo -e "\e[32;1m[OK]\e[0m"
+else
+    echo -e "\033[31msome trouble happened,perhaps template is not exist\033[0m"
+    exit
+fi
+
+#基于模板创建新的xml配置文件
+cat /var/lib/libvirt/images/rh6.xml > /tmp/rh6vm.xml
+
+#xml配置文件中必须修改的地方有：
+#虚拟机名称
+#uuid
+#镜像文件名称
+#mac地址
+sed -i "/<name>${BASEVM}/s/${BASEVM}/${NEWVM}/" /tmp/rh6vm.xml
+
+sed -i "/uuid/s/<uuid>.*<\/uuid>/<uuid>$(uuidgen)<\/uuid>/" /tmp/rh6vm.xml
+
+sed -i "/${BASEVM}\.img/s/${BASEVM}/${NEWVM}/" /tmp/rh6vm.xml
+
+#随机生成mac地址
+#替换旧mac地址
+nmac=$(echo 00:62:2f:`openssl rand -hex 3 | sed 's/\(..\)/\1:/g; s/.$//'`)
+sed -i "53s/64:52:a1:a2:a3:01/$nmac/" /tmp/rh6vm.xml
+
+nmac=$(echo 00:62:3f:`openssl rand -hex 3 | sed 's/\(..\)/\1:/g; s/.$//'`)
+sed -i "59s/64:52:b1:b2:b3:02/$nmac/" /tmp/rh6vm.xml
+
+nmac=$(echo 00:62:4f:`openssl rand -hex 3 | sed 's/\(..\)/\1:/g; s/.$//'`)
+sed -i "65s/64:52:c1:c2:c3:03/$nmac/" /tmp/rh6vm.xml
+
+nmac=$(echo 00:62:5f:`openssl rand -hex 3 | sed 's/\(..\)/\1:/g; s/.$//'`)
+sed -i "71s/64:52:d1:d2:d3:04/$nmac/" /tmp/rh6vm.xml
+
+echo -en "Defining new virtual machine......\t\t"
+
+#根据xml文件定义新的虚拟机
+virsh define /tmp/rh6vm.xml &> /dev/null
+if [ $? -ne 0 ];then
+    echo -e "\033[31m配置文件有误,请使用virsh define /tmp/rh6vm.xml进行手动检查...\033[0m"
+    rm -rf /var/lib/libvirt/images/${NEWVM}.img
+    rm -rf /etc/libvirt/qemu/${NEWVM}.xml
+    exit
+else
+    echo -e "\e[32;1m[OK]\e[0m"
+fi
+######################虚拟机创建完成##########################
+#创建挂载点并确认是否已经存在---》离线挂载
+mountpoint="/mnt/virtimage"
+[ ! -d $mountpoint ] && mkdir $mountpoint
+echo "请稍等..."
+
+if mount | grep -q "$mountpoint";then
+    umount $mountpoint
+fi
+#查询guestmount工具包是否安装
+rpm -q libguestfs-tools-c &> /dev/null
+if [ $? -ne 0 ];then
+    yum -y install libguestfs-tools-c &> /dev/null
+fi
+if [ $? -ne 0 ];then
+    echo -e "\033[31m请检查yum源配置或手动安装\033[0m"
+fi
+
+guestmount -d $NEWVM -i $mountpoint
+if [ $? -ne 0 ];then
+    echo -e "\033[31m发生了点意外，请稍后重起试试...\033[0m"
+    exit
+fi
+#########################################################################
+#定义函数判断IP合法性
+CheckIPaddr()                                                             
+{
+    echo $1| grep "^[0-9]\{1,3\}\.\([0-9]\{1,3\}\.\)\{2\}[0-9]\{1,3\}$"
+    if [ $? -ne 0 ];then
+        return 1
+    fi
+    ipaddr=$1
+    #以点号分隔，取出ip中四列的值
+    num1=`echo $ipaddr | awk -F "." '{print $1}'`
+    num2=`echo $ipaddr | awk -F "." '{print $2}'`
+    num3=`echo $ipaddr | awk -F "." '{print $3}'`
+    num4=`echo $ipaddr | awk -F "." '{print $4}'`
+    for num in $num1 $num2 $num3 $num4
+    do
+        if [ $num -gt 255 ] || [ $num -lt 0 ];then
+            return 1
+        fi
+    done
+    return 0
+}
+######################################################################
+#定义IP及子网掩码
+#read -p "请输入需要修改的网卡名称：" eth0
+while true
+do
+    read -p "请输入IP地址(点分十进制)：" addr
+    CheckIPaddr $addr
+    if [ $? -ne 0 ];then
+        echo -e "\033[31m请输入正确的IP地址！！！\033[0m"
+        continue
+    fi
+    break
+done
+while :
+do
+    read -p "请输入子网掩码(默认255.255.255.0):" mask
+    mask=${mask:-255.255.255.0}
+    CheckIPaddr $mask
+    if [ $? -ne 0 ];then
+        echo -e "\033[31m请输入正确的子网掩码！！！\033[0m"
+        continue
+    fi
+    break
+done
+###################################################################################
+#定义主机名
+echo "
+DEVICE=eth0
+TYPE=Ethernet
+ONBOOT=yes
+BOOTPROTO=none
+IPADDR=$addr
+NETMASK=$mask
+USERCTL=no" > $mountpoint/etc/sysconfig/network-scripts/ifcfg-eth0
+
+while :
+do
+    read -p "请输入主机名：" htname
+    if [ "$htname" == "" ];then
+        echo -e "\033[31m请输入有效的主机名！！\033[0m"
+        continue
+    else
+        break 
+    fi
+done
+
+echo "
+NETWORKING=yes
+HOSTNAME=$htname" > $mountpoint/etc/sysconfig/network
+############################################################################
+#定义网络yum源
+while :
+do
+    read -p "请输入网络yum源的IP地址：" gw
+    CheckIPaddr $gw
+    if [ $? -ne 0 ];then
+        echo -e "\033[31m请输入正确的IP地址！！！\033[0m"
+        continue
+    fi
+    break
+done
+
+echo "[rhel-6]
+name=rhel
+baseurl=http://$gw/rhel6
+enabled=1
+gpgcheck=0
+
+[rhel-6_balancer]
+name=loadbalancer
+baseurl=http://$gw/rhel6/LoadBalancer
+" > $mountpoint/etc/yum.repos.d/rhel6.repo
+#############################################################################
+sed -i '/SELINUX/s/=permissive/=disabled/' $mountpoint/etc/selinux/config
+echo "selinux已设置成关闭状态"
+
+################################################################################
+echo "set nu
+set autoindent
+set ai
+autocmd FileType yml setlocal ai et ts=2" > $mountpoint/root/.vimrc
+
+#################################################################################
+echo  "设置完成..."
+umount $mountpoint
+echo "请稍等..."
+sleep 3
+echo ""
+while :
+do
+    read -p "是否现在启动虚拟机（y/n）："  choice
+    if [ "$choice" == "y" ];then
+        echo "正在启动虚拟机..."
+        virsh start $NEWVM
+        exit
+    elif [ "$choice" == "n" ];then
+        echo "请手动启动虚拟机..."
+        exit
+    else
+        echo "请输入正确的选项"
+        continue
+    fi
+done
